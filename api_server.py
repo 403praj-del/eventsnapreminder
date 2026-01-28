@@ -2,283 +2,151 @@ from fastapi import FastAPI, UploadFile, HTTPException
 import uvicorn
 import os
 import shutil
-import easyocr
-import cv2
-import numpy as np
-import re
 import traceback
 import requests
 import json
-import gc
-import torch # Ensure we can set threads
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-torch.set_num_threads(1)
-
-try:
-    from ctransformers import AutoModelForCausalLM
-except ImportError:
-    AutoModelForCausalLM = None
+import base64
+import time
 
 # --- CONFIGURATION ---
 PORT = 8000
-MODEL_DIR = os.path.join(os.getcwd(), 'easyocr_models')
-LOCAL_LLM_DIR = os.path.join(os.getcwd(), 'local_llm_models')
 
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(LOCAL_LLM_DIR, exist_ok=True)
+def load_api_keys():
+    keys = []
+    # 1. Check System Environment Variables
+    env_key = os.getenv("OPENROUTER_API_KEY")
+    if env_key:
+        keys.append(env_key)
 
-# Secondary AI (Local OpenChat)
-LOCAL_MODEL_REPO = "TheBloke/openchat_3.5-GGUF"
-LOCAL_MODEL_FILE = "openchat_3.5.Q4_K_M.gguf"
+    # 2. Check local .env file
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            for line in f:
+                if line.startswith("OPENROUTER_API_KEY="):
+                    key = line.strip().split('=', 1)[1].strip()
+                    if key and key not in keys:
+                        keys.append(key)
+    
+    # 3. Fallback to hardcoded default
+    if not keys:
+        keys = ["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"]
+    return keys
+
+API_KEYS = load_api_keys()
+VISION_MODEL = "google/gemma-3-4b-it:free"
 
 app = FastAPI()
-
-# Global Variables
-reader = None
-local_llm = None
-
-ocr_error = None
 
 @app.get("/health")
 def health_check():
     return {
         "status": "online",
-        "ocr_loaded": reader is not None,
-        "llm_loaded": local_llm is not None
+        "keys_loaded": len(API_KEYS),
+        "mode": "vision_ai"
     }
 
-# --- AI PROMPT ---
-SYSTEM_PROMPT = """
-You are a high-precision Indian invitation data extractor.
-Text may contain Tamil + English.
-Return ONLY structured JSON.
-
-[GOAL]
-Extract: event_name, event_type, date, time, venue, address, names, phone_numbers
-
-[HIERARCHY OF NAMES]
-1. COUPLE (High Priority): Names following "Selvan/Mappilai" (Groom) or "Selvi/Penn" (Bride).
-2. PARENTS (Skip): Names following "Thiru/Thirumathi", "Son of", "Daughter of", "S/o", "D/o".
-3. HOSTS/ELDERS (Skip): Names in "Invited by", "With blessings of", "Anoopunar".
-
-[CLEANING RULES]
-- Strip honorifics (Mr, Mrs, Thiru, Selvan, Selvi, Er, Dr, Late) from final names.
-- If name is "Thiru valar [Name]", the name is "[Name]".
-- Fix typos (e.g. "Vivaham" instead of "Vvaham").
-- TIME: "காலை" = AM, "மாலை" = PM. (e.g. "மாலை 6.30" -> "06:30 PM")
-
-[FEW-SHOT EXAMPLES]
-# Traditional Tamil
-Input: "மாலை 6.30 மணியளவில்"
-Output: {"time": "06:30 PM", ...}
-
-Input: "Thiru. Mani & Thirumathi. Jaya invite you to the Subha Muhurtham of their son Selvan. ARUN with Selvi. DIVYA (D/o Thiru. Ravi)"
-Output: {"names": {"bride": "DIVYA", "groom": "ARUN"}, "event_name": "Subha Muhurtham", "event_type": "Marriage"}
-
-# Formal English (Host Line)
-Input: "Mr. and Mrs. Robert Johnson request the honor of your presence at the marriage of their daughter Sarah Elizabeth to Michael James, son of Mr. and Mrs. Alan Smith"
-Output: {"names": {"bride": "Sarah Elizabeth", "groom": "Michael James"}, "event_name": "Marriage", "event_type": "Wedding"}
-
-# Mixed Language / Noisy
-Input: "Cordially invite you for the Wedding of Selvan VICKY S/o Mr. Siva and Selvi RADHA D/o Mr. Kumar"
-Output: {"names": {"bride": "RADHA", "groom": "VICKY"}, "event_name": "Wedding", "event_type": "Marriage"}
-
-Values:
-- date: DD-MM-YYYY
-- time: HH:MM AM/PM
-- names: { "bride": "CLEAN_NAME", "groom": "CLEAN_NAME" }
-"""
-
-# --- STARTUP LOGIC ---
 @app.on_event("startup")
 def startup_sequence():
-    global reader, local_llm
-    print("--- [SERVER STARTUP: LOCAL AI MODE] ---")
-    
-    # 1. Load OCR
-    print("[1/2] Loading EasyOCR (Tamil+English)...")
-    try:
-        reader = easyocr.Reader(['ta', 'en'], gpu=False, model_storage_directory=MODEL_DIR)
-        print("      EasyOCR Loaded.")
-    except Exception as e:
-        print(f"      FATAL: OCR Failed: {e}")
+    print("--- [SERVER STARTUP: VISION AI MODE] ---")
+    print(f"    Active model: {VISION_MODEL}")
+    print(f"    Loaded {len(API_KEYS)} API Keys for rotation.")
 
-    # 2. Load Local LLM
-    print("[2/2] Loading Local LLM (OpenChat)...")
-    if AutoModelForCausalLM is None:
-        print("      FATAL: ctransformers not installed.")
-        return
-
-    model_path = os.path.join(LOCAL_LLM_DIR, LOCAL_MODEL_FILE)
-    try:
-        local_llm = AutoModelForCausalLM.from_pretrained(
-            LOCAL_MODEL_REPO,
-            model_file=LOCAL_MODEL_FILE,
-            model_type="mistral",
-            context_length=1024,
-            gpu_layers=0,
-            batch_size=256,
-            threads=8
-        )
-        print("      Local LLM Loaded Successfully!")
-    except Exception as e:
-        print(f"      FATAL: Local LLM Load Failed: {e}")
-
-    print("--- [SERVER READY] ---")
-
-# --- HELPER FUNCTIONS ---
-def preprocess_image(image_path):
-    img = cv2.imread(image_path)
-    if img is None: raise ValueError("Could not read image")
-    
-    # Local quality upscaling
-    h, w = img.shape[:2]
-    if w < 1000:
-        scale = 2 if w > 500 else 3
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        print(f"[PREPROCESS] Upscaled x{scale}")
-        
-    # CLAHE
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-def clean_noise(text_list):
-    cleaned = []
-    for line in text_list:
-        if len(line.strip()) < 2: continue # Keep 'At', 'On'
-        
-        chars = len(line)
-        alpha = len(re.findall(r'\w', line))
-        if alpha / chars < 0.4: continue # Too many symbols
-        
-        if line.startswith('I^') or line.startswith('|'): continue
-        cleaned.append(line.strip())
-    return cleaned
-
-import warnings
-# Suppress specific PyTorch warning about pin_memory
-warnings.filterwarnings("ignore", message=".*pin_memory.*")
-
-# Removed OpenRouter Primary AI for Local-Only Mode
-
-# --- TAMIL CONTEXT FOR LOCAL AI ---
-TAMIL_LEARNING_CONTEXT = """
-[TAMIL DICTIONARY]
-- Thirumanam / Vivaham / Subha Muhurtham -> Wedding / Marriage
-- Manamagan / Selvan / Mappilai -> Groom (Priority for Name)
-- Manamagal / Selvi / Penn -> Bride (Priority for Name)
-- Muhurtham / Neram -> Auspicious Time
-- Idam / Nilayam -> Venue
-- Petror / Anuppunar -> Parents / Senders (IGNORE for Bride/Groom names)
-- Thiru / Thirumathi / Magan / Magal -> Mr / Mrs / Son / Daughter (Parent context - IGNORE for Name)
-- Naal / Thethi -> Date
-- Kaalai -> AM (Morning)
-- Maalai -> PM (Evening)
-"""
-
-def call_secondary_ai(ocr_text):
-    global local_llm
-    if local_llm is None:
-        print("[AI:Secondary] Not available (Model not loaded).")
-        return None
-        
-    print("[AI:Secondary] Calling Local OpenChat...")
-    try:
-        # Improved In-Context Learning for Names
-        prompt = f"""System: {SYSTEM_PROMPT}
-
-[CULTURAL CONTEXT]
-In Indian invitations, the names following "Selvan" or "Mappilai" is the Groom. 
-The names following "Selvi" or "Penn" is the Bride.
-Names following "Thiru" and "Thirumathi" are usually the PARENTS. Do not confuse them.
-Strip honorifics (Mr., Mrs., Thiru, Selvi) from the final JSON name fields.
-
-[TAMIL DICTIONARY] 
-{TAMIL_LEARNING_CONTEXT}
-
-User: Extract the COUPLE names (Bride/Groom) and event details:
-{ocr_text}
-
-Assistant: Here is the JSON:
-```json
-"""
-        
-        # Add prints to debug blockage
-        print("[AI:Secondary] Starting generation...")
-        start_time = time.time()
-        
-        response = local_llm(
-            prompt, 
-            max_new_tokens=512, # Restored full length (User requested no restriction)
-            temperature=0.1,
-            stop=["```"]
-        )
-        
-        print(f"[AI:Secondary] Generation complete in {time.time() - start_time:.2f}s")
-        print(f"[AI:Secondary] Raw response: {response[:100]}...") # Print first 100 chars
-        
-        # Cleanup ensures we get valid JSON
-        return extract_json_block("{" + response) # We forced the prompt to end at ```json, so response starts with {
-        
-    except Exception as e:
-        print(f"[AI:Secondary] Error: {e}")
-        traceback.print_exc()
-        return None
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
 def extract_json_block(text):
     try:
-        # Find JSON between ```json and ``` or just start to end
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
-            text = text.split("```")[0]
-            
+            text = text.split("```")[1].split("```")[0] # Fix potential dual backticks
         return json.loads(text.strip())
     except:
-        # Retry with soft cleaning
+        # Fallback to finding generic {}
         try:
-            return json.loads(text.strip())
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            return json.loads(text[start:end])
         except:
             return None
 
+# Removed OCR Preprocessing and Manual AI calls - using Direct Vision API
+
 # --- MAIN ENDPOINT ---
 @app.post("/ocr")
-async def process_invitation(file: UploadFile):
-    global reader, local_llm
-    
-    if reader is None or local_llm is None:
-        return {"error": "Server components still loading..."}
-
+async def analyze_invitation(file: UploadFile):
     temp_path = f"temp_{int(time.time())}_{file.filename}"
     try:
-        with open(temp_path, "wb") as f: shutil.copyfileobj(file.file, f)
+        with open(temp_path, "wb") as f: 
+            shutil.copyfileobj(file.file, f)
         
-        # 1. OCR Step
-        print(f"[OCR] Processing {file.filename}...")
-        proc_img = preprocess_image(temp_path)
-        result = reader.readtext(proc_img, detail=0, paragraph=True)
-        ocr_text = " ".join(clean_noise(result)).strip()
-        print(f"[OCR] Success. Extracted {len(ocr_text)} chars.")
+        print(f"[VISION:START] Analyzing image: {file.filename}")
+        base64_image = encode_image(temp_path)
         
-        if not ocr_text:
-            return {"status": "failed", "reason": "NO_TEXT_FOUND"}
-            
-        # 2. Local AI Call
-        print(f"[AI] Calling Local OpenChat...")
-        ai_data = call_secondary_ai(ocr_text)
-        
-        if ai_data:
-            ai_data['ocr_text_raw'] = ocr_text
-            ai_data['ai_source'] = "local_llm"
-            return ai_data
-        else:
-            return {
-                "status": "partial",
-                "ocr_text_raw": ocr_text,
-                "ai_source": "failed"
-            }
+        # Prompt for Vision Model
+        prompt_text = """
+        You are a high-precision Indian invitation data extractor. Return ONLY JSON.
+        Extract: event_name, event_type, date, time, venue, address, names (bride, groom).
+        Rules: Strip honorifics (Mr, Thiru, Selvan). Format date as DD-MM-YYYY.
+        Target JSON: {"event_name": "...", "event_type": "Wedding/Reception/...", "date": "...", "time": "...", "venue": "...", "names": {"bride": "...", "groom": "..."}}
+        """
+
+        # Rotation Logic for Multiple API Keys
+        for i, api_key in enumerate(API_KEYS):
+            print(f"  [Attempt {i+1}] Using key: ...{api_key[-6:]}")
+            try:
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                
+                payload = {
+                    "model": VISION_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "response_format": {"type": "json_object"}
+                }
+                
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result_data = response.json()
+                    ai_content = result_data['choices'][0]['message']['content']
+                    final_json = extract_json_block(ai_content)
+                    if final_json:
+                        final_json['ai_source'] = f"vision_api (key_{i+1})"
+                        print("[VISION:SUCCESS] Data extracted.")
+                        return final_json
+                elif response.status_code in [429, 401]:
+                    print(f"  [Skip] Key failed with status {response.status_code}. Trying next...")
+                    continue
+                else:
+                    print(f"  [Failed] OpenRouter Error: {response.text}")
+                    
+            except Exception as inner_e:
+                print(f"  [Error] Key {i+1} Exception: {inner_e}")
+                continue
+
+        return {"status": "failed", "reason": "ALL_API_KEYS_FAILED"}
 
     except Exception as e:
         traceback.print_exc()

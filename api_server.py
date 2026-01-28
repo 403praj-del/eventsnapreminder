@@ -9,7 +9,7 @@ import re
 import traceback
 import requests
 import json
-import time
+import gc
 try:
     from ctransformers import AutoModelForCausalLM
 except ImportError:
@@ -164,11 +164,16 @@ def preprocess_image(image_path):
     img = cv2.imread(image_path)
     if img is None: raise ValueError("Could not read image")
     
-    # Smart Upscaling (< 1000px)
-    h, w = img.shape[:2]
-    if w < 1000:
-        scale = 2 if w > 500 else 3
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # --- CLOUD OPTIMIZATION ---
+    # Disable upscaling in cloud to save RAM (Upscaling x3 uses 9x more memory)
+    if ENV_TYPE == "CLOUD":
+        print("[PREPROCESS] Skipping upscale to save RAM (Cloud Mode).")
+    else:
+        h, w = img.shape[:2]
+        if w < 1000:
+            scale = 2 if w > 500 else 3
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            print(f"[PREPROCESS] Upscaled x{scale}")
         
     # CLAHE
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -339,13 +344,20 @@ async def process_invitation(file: UploadFile):
         try:
             proc_img = preprocess_image(temp_path)
             print("[OCR:STATUS] Preprocessing complete.")
+            
             result = reader.readtext(proc_img, detail=0, paragraph=True, text_threshold=0.4, low_text=0.3, link_threshold=0.4, mag_ratio=1.5)
+            
+            # Explicitly clear image from RAM
+            del proc_img
+            gc.collect() 
+            
             cleaned_ocr = clean_noise(result)
             ocr_text = " ".join(cleaned_ocr).strip()
             print(f"[OCR:FINISH] Extracted {len(ocr_text)} chars.")
         except Exception as ocr_err:
-            print(f"[OCR:FATAL] Component Failure: {ocr_err}")
-            return {"status": "failed", "reason": "OCR_PROCESS_ERROR", "error": str(ocr_err)}
+            error_trace = traceback.format_exc()
+            print(f"[OCR:FATAL] Component Failure: {ocr_err}\n{error_trace}")
+            return {"status": "failed", "reason": "OCR_PROCESS_ERROR", "error": str(ocr_err), "trace": error_trace}
         
         if not ocr_text:
             print("[OCR:EMPTY] No text detected in image.")

@@ -9,7 +9,7 @@ import re
 import traceback
 import requests
 import json
-import time
+import gc
 try:
     from ctransformers import AutoModelForCausalLM
 except ImportError:
@@ -30,7 +30,13 @@ OPENROUTER_MODEL = "google/gemma-3n-e4b-it:free"
 
 def load_api_keys():
     keys = []
-    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+    # 1. Check System Environment Variables (Priority for Cloud/Railway)
+    env_key = os.getenv("OPENROUTER_API_KEY")
+    if env_key:
+        keys.append(env_key)
+
+    # 2. Check local .env file (for Local testing)
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.exists(env_path):
         with open(env_path, 'r') as f:
             for line in f:
@@ -39,7 +45,7 @@ def load_api_keys():
                     if key and key not in keys:
                         keys.append(key)
     
-    # Fallback to defaults if empty
+    # 3. Fallback to hardcoded default
     if not keys:
         keys = ["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"]
     return keys
@@ -158,11 +164,16 @@ def preprocess_image(image_path):
     img = cv2.imread(image_path)
     if img is None: raise ValueError("Could not read image")
     
-    # Smart Upscaling (< 1000px)
-    h, w = img.shape[:2]
-    if w < 1000:
-        scale = 2 if w > 500 else 3
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # --- CLOUD OPTIMIZATION ---
+    # Disable upscaling in cloud to save RAM (Upscaling x3 uses 9x more memory)
+    if ENV_TYPE == "CLOUD":
+        print("[PREPROCESS] Skipping upscale to save RAM (Cloud Mode).")
+    else:
+        h, w = img.shape[:2]
+        if w < 1000:
+            scale = 2 if w > 500 else 3
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            print(f"[PREPROCESS] Upscaled x{scale}")
         
     # CLAHE
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -329,16 +340,30 @@ async def process_invitation(file: UploadFile):
         with open(temp_path, "wb") as f: shutil.copyfileobj(file.file, f)
         
         # 1. OCR Step
-        print(f"Processing {file.filename}...")
-        proc_img = preprocess_image(temp_path)
-        result = reader.readtext(proc_img, detail=0, paragraph=True, text_threshold=0.4, low_text=0.3, link_threshold=0.4, mag_ratio=1.5)
-        cleaned_ocr = clean_noise(result)
-        ocr_text = " ".join(cleaned_ocr).strip()
+        print(f"[OCR:START] Processing {file.filename}...")
+        try:
+            proc_img = preprocess_image(temp_path)
+            print("[OCR:STATUS] Preprocessing complete.")
+            
+            result = reader.readtext(proc_img, detail=0, paragraph=True, text_threshold=0.4, low_text=0.3, link_threshold=0.4, mag_ratio=1.5)
+            
+            # Explicitly clear image from RAM
+            del proc_img
+            gc.collect() 
+            
+            cleaned_ocr = clean_noise(result)
+            ocr_text = " ".join(cleaned_ocr).strip()
+            print(f"[OCR:FINISH] Extracted {len(ocr_text)} chars.")
+        except Exception as ocr_err:
+            error_trace = traceback.format_exc()
+            print(f"[OCR:FATAL] Component Failure: {ocr_err}\n{error_trace}")
+            return {"status": "failed", "reason": "OCR_PROCESS_ERROR", "error": str(ocr_err), "trace": error_trace}
         
         if not ocr_text:
+            print("[OCR:EMPTY] No text detected in image.")
             return {"status": "failed", "reason": "NO_TEXT_FOUND"}
             
-        print(f"OCR Text ({len(ocr_text)} chars). Starting AI...")
+        print(f"[AI:START] Sending text to AI models...")
 
         # 2. Primary AI
         ai_data = call_primary_ai(ocr_text)

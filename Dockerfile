@@ -7,8 +7,11 @@ ENV ENV_TYPE=CLOUD
 ENV EASYOCR_MODEL_DIR=/app/easyocr_models
 ENV PORT=10000
 
-# Install minimal system dependencies (General processing requirement)
+# Install system dependencies (Full compatibility requirement)
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \

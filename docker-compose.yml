@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  ocr-backend:
+    build: .
+    ports:
+      - "10000:10000"
+    environment:
+      - ENV_TYPE=LOCAL
+      - PORT=10000
+    volumes:
+      - ./easyocr_models:/app/easyocr_models
+      - ./local_llm_models:/app/local_llm_models

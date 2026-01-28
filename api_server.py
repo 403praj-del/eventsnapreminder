@@ -22,7 +22,7 @@ except ImportError:
 
 # --- CONFIGURATION ---
 ENV_TYPE = os.getenv("ENV_TYPE", "LOCAL").upper() # LOCAL or CLOUD
-PORT = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 8080))
 MODEL_DIR = os.getenv("EASYOCR_MODEL_DIR", os.path.join(os.getcwd(), 'easyocr_models'))
 LOCAL_LLM_DIR = os.getenv("LOCAL_LLM_DIR", os.path.join(os.getcwd(), 'local_llm_models'))
 
@@ -69,6 +69,10 @@ reader = None
 local_llm = None
 
 ocr_error = None
+
+@app.get("/")
+def root_redirect():
+    return {"message": "EventSnap AI Backend is running.", "health_check": "/health"}
 
 @app.get("/health")
 def health_check():

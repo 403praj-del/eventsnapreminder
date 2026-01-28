@@ -1,3 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
 fastapi==0.104.1
 uvicorn==0.24.0
 easyocr==1.7.1

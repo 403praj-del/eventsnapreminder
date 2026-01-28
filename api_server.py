@@ -131,9 +131,9 @@ def startup_sequence():
     
     # 1. Load OCR (Skip in Extreme Cloud mode to keep RAM zero at idle)
     if ENV_TYPE == "CLOUD":
-        print("[1/3] Extreme Cloud Mode: OCR will be loaded per-request to save RAM.")
+        print("[1/3] Extreme Cloud Mode: OCR will be loaded per-request (English First) to save RAM.")
     else:
-        print("[1/3] Loading EasyOCR...")
+        print("[1/3] Loading EasyOCR (Tamil+English)...")
         try:
             reader = easyocr.Reader(['ta', 'en'], gpu=False, verbose=False, download_enabled=True, model_storage_directory=MODEL_DIR)
             print("      EasyOCR Loaded.")
@@ -352,13 +352,24 @@ async def process_invitation(file: UploadFile):
     
     # Lazy Load/Retry if first attempt failed
     if reader is None:
-        print("[OCR:RETRY] attempting late initialization...")
+        print("[OCR:RETRY] attempting on-demand initialization...")
         try:
-            reader = easyocr.Reader(['ta', 'en'], gpu=False, verbose=False, download_enabled=True, model_storage_directory=MODEL_DIR)
+            # In cloud, we try English only first to verify RAM limits
+            langs = ['en'] if ENV_TYPE == "CLOUD" else ['ta', 'en']
+            # download_enabled=False because Docker build already grabbed them
+            reader = easyocr.Reader(langs, gpu=False, download_enabled=False, model_storage_directory=MODEL_DIR)
             ocr_error = None
+            print(f"[OCR:STATUS] Reader initialized with {langs}")
         except Exception as retry_err:
             ocr_error = str(retry_err)
-            return {"status": "failed", "reason": "SERVER_INITIALIZING_FAILED", "error": ocr_error}
+            trace = traceback.format_exc()
+            print(f"[OCR:RETRY_FATAL] Load failed: {ocr_error}\n{trace}")
+            return {
+                "status": "failed", 
+                "reason": "SERVER_INITIALIZING_FAILED", 
+                "error": ocr_error,
+                "trace": trace
+            }
 
     temp_path = f"temp_{int(time.time())}_{file.filename}"
     try:

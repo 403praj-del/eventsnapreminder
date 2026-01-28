@@ -10,7 +10,10 @@ import traceback
 import requests
 import json
 import time
-from ctransformers import AutoModelForCausalLM
+try:
+    from ctransformers import AutoModelForCausalLM
+except ImportError:
+    AutoModelForCausalLM = None
 
 # --- CONFIGURATION ---
 ENV_TYPE = os.getenv("ENV_TYPE", "LOCAL").upper() # LOCAL or CLOUD

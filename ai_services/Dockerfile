@@ -6,6 +6,9 @@ ENV PYTHONUNBUFFERED=1
 ENV ENV_TYPE=CLOUD
 ENV EASYOCR_MODEL_DIR=/app/easyocr_models
 ENV PORT=10000
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV PYTORCH_NO_CUDA_MEMORY_CACHING=1
 
 # Install system dependencies (Full compatibility requirement)
 RUN apt-get update && apt-get install -y \

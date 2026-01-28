@@ -10,6 +10,11 @@ import traceback
 import requests
 import json
 import gc
+import torch # Ensure we can set threads
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+
 try:
     from ctransformers import AutoModelForCausalLM
 except ImportError:
@@ -124,14 +129,17 @@ def startup_sequence():
     global reader, local_llm, ocr_error
     print(f"--- [SERVER STARTUP: {ENV_TYPE}] ---")
     
-    # 1. Load OCR
-    print("[1/3] Loading EasyOCR...")
-    try:
-        reader = easyocr.Reader(['ta', 'en'], gpu=False, verbose=False, download_enabled=True, model_storage_directory=MODEL_DIR)
-        print("      EasyOCR Loaded.")
-    except Exception as e:
-        ocr_error = str(e)
-        print(f"      FATAL: OCR Failed: {e}")
+    # 1. Load OCR (Skip in Extreme Cloud mode to keep RAM zero at idle)
+    if ENV_TYPE == "CLOUD":
+        print("[1/3] Extreme Cloud Mode: OCR will be loaded per-request to save RAM.")
+    else:
+        print("[1/3] Loading EasyOCR...")
+        try:
+            reader = easyocr.Reader(['ta', 'en'], gpu=False, verbose=False, download_enabled=True, model_storage_directory=MODEL_DIR)
+            print("      EasyOCR Loaded.")
+        except Exception as e:
+            ocr_error = str(e)
+            print(f"      FATAL: OCR Failed: {e}")
 
     # 2. Load Local LLM (Secondary) - OPTIONAL ON CLOUD
     if ENV_TYPE == "CLOUD":
@@ -166,20 +174,26 @@ def preprocess_image(image_path):
     img = cv2.imread(image_path)
     if img is None: raise ValueError("Could not read image")
     
-    # --- CLOUD OPTIMIZATION ---
-    # Disable upscaling in cloud to save RAM (Upscaling x3 uses 9x more memory)
+    # --- EXTREME CLOUD OPTIMIZATION ---
+    # Downscale and compress to stay under 512MB
     if ENV_TYPE == "CLOUD":
-        print("[PREPROCESS] Skipping upscale to save RAM (Cloud Mode).")
+        h, w = img.shape[:2]
+        max_dim = 800 # Very small for strict memory
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            print(f"[PREPROCESS] Extreme Downscale to {max_dim}px (RAM SAVE)")
     else:
+        # Local logic (higher quality)
         h, w = img.shape[:2]
         if w < 1000:
             scale = 2 if w > 500 else 3
             img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             print(f"[PREPROCESS] Upscaled x{scale}")
         
-    # CLAHE
+    # CLAHE (Mild)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     return clahe.apply(gray)
 
 def clean_noise(text_list):
@@ -351,20 +365,31 @@ async def process_invitation(file: UploadFile):
         with open(temp_path, "wb") as f: shutil.copyfileobj(file.file, f)
         
         # 1. OCR Step
-        print(f"[OCR:START] Processing {file.filename}...")
+        print(f"[OCR:START] Extreme processing for {file.filename}...")
         try:
+            # Re-init reader ONLY during request if in Cloud to keep RAM free
+            local_reader = reader
+            if local_reader is None:
+                print("[OCR] Initializing engine on-demand...")
+                local_reader = easyocr.Reader(['ta', 'en'], gpu=False, model_storage_directory=MODEL_DIR)
+
             proc_img = preprocess_image(temp_path)
-            print("[OCR:STATUS] Preprocessing complete.")
             
-            result = reader.readtext(proc_img, detail=0, paragraph=True, text_threshold=0.4, low_text=0.3, link_threshold=0.4, mag_ratio=1.5)
+            # Use torch.no_grad to save memory
+            with torch.no_grad():
+                result = local_reader.readtext(proc_img, detail=0, paragraph=True)
             
-            # Explicitly clear image from RAM
+            # AGGRESSIVE PURGE
             del proc_img
+            if ENV_TYPE == "CLOUD":
+                print("[OCR] Purging engine to free RAM...")
+                del local_reader
+            
             gc.collect() 
             
             cleaned_ocr = clean_noise(result)
             ocr_text = " ".join(cleaned_ocr).strip()
-            print(f"[OCR:FINISH] Extracted {len(ocr_text)} chars.")
+            print(f"[OCR:FINISH] Success. Extracted {len(ocr_text)} chars.")
         except Exception as ocr_err:
             error_trace = traceback.format_exc()
             print(f"[OCR:FATAL] Component Failure: {ocr_err}\n{error_trace}")

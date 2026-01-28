@@ -63,12 +63,15 @@ app = FastAPI()
 reader = None
 local_llm = None
 
+ocr_error = None
+
 @app.get("/health")
 def health_check():
     return {
         "status": "online",
         "env": ENV_TYPE,
         "ocr_loaded": reader is not None,
+        "ocr_error": ocr_error,
         "llm_loaded": local_llm is not None,
         "timestamp": time.time()
     }
@@ -118,21 +121,16 @@ Values:
 # --- STARTUP LOGIC ---
 @app.on_event("startup")
 def startup_sequence():
-    global reader, local_llm
+    global reader, local_llm, ocr_error
     print(f"--- [SERVER STARTUP: {ENV_TYPE}] ---")
     
     # 1. Load OCR
     print("[1/3] Loading EasyOCR...")
     try:
-        reader = easyocr.Reader(
-            ['ta', 'en'], 
-            gpu=False, 
-            verbose=False, 
-            download_enabled=True, 
-            model_storage_directory=MODEL_DIR
-        )
+        reader = easyocr.Reader(['ta', 'en'], gpu=False, verbose=False, download_enabled=True, model_storage_directory=MODEL_DIR)
         print("      EasyOCR Loaded.")
     except Exception as e:
+        ocr_error = str(e)
         print(f"      FATAL: OCR Failed: {e}")
 
     # 2. Load Local LLM (Secondary) - OPTIONAL ON CLOUD
@@ -140,6 +138,10 @@ def startup_sequence():
         print("[2/3] Skipping Local LLM (CLOUD MODE) to save RAM.")
     else:
         print("[2/3] Checking Local LLM (OpenChat)...")
+        if AutoModelForCausalLM is None:
+            print("      WARNING: ctransformers not installed. Skipping local LLM.")
+            return
+
         model_path = os.path.join(LOCAL_LLM_DIR, LOCAL_MODEL_FILE)
         try:
             print("      Loading Local Model into RAM...")
@@ -330,10 +332,19 @@ def extract_json_block(text):
             return None
 
 # --- MAIN ENDPOINT ---
-@app.post("/ocr") # Keeping endpoint name same for minimal friction, but now it returns JSON
+@app.post("/ocr")
 async def process_invitation(file: UploadFile):
-    global reader
-    if reader is None: return {"error": "Server Initializing..."}
+    global reader, ocr_error
+    
+    # Lazy Load/Retry if first attempt failed
+    if reader is None:
+        print("[OCR:RETRY] attempting late initialization...")
+        try:
+            reader = easyocr.Reader(['ta', 'en'], gpu=False, verbose=False, download_enabled=True, model_storage_directory=MODEL_DIR)
+            ocr_error = None
+        except Exception as retry_err:
+            ocr_error = str(retry_err)
+            return {"status": "failed", "reason": "SERVER_INITIALIZING_FAILED", "error": ocr_error}
 
     temp_path = f"temp_{int(time.time())}_{file.filename}"
     try:

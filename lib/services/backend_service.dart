@@ -5,7 +5,7 @@ import 'package:http/http.dart' as http;
 class BackendService {
   // --- ENDPOINT CONFIG ---
   // If you deploy to Railway/Render, put your URL here (e.g., https://ocr-app.up.railway.app)
-  static const String _cloudUrl = 'https://eventsnapreminder-production.up.railway.app'; 
+  static const String _cloudUrl = ''; 
 
   /// Dynamic Base URL: Prioritizes Cloud URL, then 10.0.2.2 (Android) or 127.0.0.1 (Others)
   String get _baseUrl {
